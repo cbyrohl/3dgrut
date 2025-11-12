@@ -16,9 +16,13 @@
 import logging
 import os
 from enum import IntEnum
+import glob
+import importlib
+import sys
 
 import torch
 import torch.utils.cpp_extension
+from torch.utils.cpp_extension import get_default_build_root
 
 from threedgrut.datasets.protocols import Batch
 from threedgrut.utils.timer import CudaTimer
@@ -29,6 +33,29 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------
 #
 
+def _load_from_torch_cache(mod_name: str = "lib3dgrt_cc"):
+    """Locate the compiled .so in the torch extensions cache, import it,
+    and register it under both 'lib3dgrt_cc' and 'threedgrt_tracer.lib3dgrt_cc'."""
+    root = os.environ.get("TORCH_EXTENSIONS_DIR", get_default_build_root())
+    matches = glob.glob(
+        os.path.join(root, "py*", mod_name, "**", f"{mod_name}*.so"),
+        recursive=True,
+    )
+    if not matches:
+        raise ImportError(f"Built extension {mod_name} not found in torch cache: {root}")
+    # pick the newest artifact in case there are multiple builds
+    so_path = max(matches, key=os.path.getmtime)
+
+    spec = importlib.util.spec_from_file_location(mod_name, so_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    # Make both import styles work elsewhere in the codebase
+    sys.modules[mod_name] = mod
+    sys.modules[f"threedgrt_tracer.{mod_name}"] = mod
+    return mod
+
 _3dgrt_plugin = None
 
 
@@ -36,13 +63,36 @@ def load_3dgrt_plugin(conf):
     global _3dgrt_plugin
     if _3dgrt_plugin is None:
         try:
+            # Case 1: already importable from inside the package (e.g., if you ship the .so)
             from . import lib3dgrt_cc as tdgrt  # type: ignore
         except ImportError:
+            # Case 2: build, then load from torch cache
             from .setup_3dgrt import setup_3dgrt
+            maybe_mod = setup_3dgrt(conf)
 
-            setup_3dgrt(conf)
-            import lib3dgrt_cc as tdgrt  # type: ignore
+            # If setup_3dgrt returns the module, use it; otherwise, pull it from cache.
+            if maybe_mod is not None:
+                tdgrt = maybe_mod
+                # Make absolute and package-relative imports work later
+                sys.modules['lib3dgrt_cc'] = tdgrt
+                sys.modules['threedgrt_tracer.lib3dgrt_cc'] = tdgrt
+            else:
+                tdgrt = _load_from_torch_cache("lib3dgrt_cc")
+
         _3dgrt_plugin = tdgrt
+    return _3dgrt_plugin
+
+#def load_3dgrt_plugin(conf):
+#    global _3dgrt_plugin
+#    if _3dgrt_plugin is None:
+#        try:
+#            from . import lib3dgrt_cc as tdgrt  # type: ignore
+#        except ImportError:
+#            from .setup_3dgrt import setup_3dgrt
+#
+#            setup_3dgrt(conf)
+#            import lib3dgrt_cc as tdgrt  # type: ignore
+#        _3dgrt_plugin = tdgrt
 
 
 # ----------------------------------------------------------------------------

@@ -28,19 +28,45 @@ logger = logging.getLogger(__name__)
 
 _playground_plugin = None
 
+import os, sys, glob, importlib.util
+from torch.utils.cpp_extension import get_default_build_root
+
+def _load_from_torch_cache(mod_name: str = "libplayground_cc"):
+    """Import the compiled extension from the torch extensions cache and
+    register both absolute and package-relative names."""
+    root = os.environ.get("TORCH_EXTENSIONS_DIR", get_default_build_root())
+    matches = glob.glob(
+        os.path.join(root, "py*", mod_name, "**", f"{mod_name}*.so"),
+        recursive=True,
+    )
+    if not matches:
+        raise ImportError(f"Built extension {mod_name} not found in torch cache: {root}")
+    so_path = max(matches, key=os.path.getmtime)  # newest build
+    spec = importlib.util.spec_from_file_location(mod_name, so_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    sys.modules[mod_name] = mod
+    sys.modules[f"threedgrut_playground.{mod_name}"] = mod
+    return mod
 
 def load_playground_plugin(conf):
     global _playground_plugin
     if _playground_plugin is None:
-        try:
-            from . import libplayground_cc as tdgrt  # type: ignore
-        except ImportError:
-            from .setup_playground import setup_playground
-
-            setup_playground(conf)
-            import libplayground_cc as tdgrt  # type: ignore
-        _playground_plugin = tdgrt
-
+       try:
+           from . import libplayground_cc as tdgrt  # type: ignore
+       except ImportError:
+           from .setup_playground import setup_playground
+           maybe_mod = setup_playground(conf)  # may return the module or None
+           if maybe_mod is not None:
+               tdgrt = maybe_mod
+               # ensure later imports work everywhere
+               sys.modules['libplayground_cc'] = tdgrt
+               sys.modules['threedgrut_playground.libplayground_cc'] = tdgrt
+           else:
+               tdgrt = _load_from_torch_cache("libplayground_cc")
+       _playground_plugin = tdgrt
+    return _playground_plugin
 
 # ----------------------------------------------------------------------------
 #
